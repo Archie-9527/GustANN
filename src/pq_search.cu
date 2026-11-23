@@ -1,5 +1,8 @@
 #include "pq_search.hpp"
 #include <fstream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 
 #include "common.hpp"
 #include "common_cuda.cuh"
@@ -186,17 +189,34 @@ namespace gustann {
 
   template<class T>
   static void read_bin(std::string filename, int& npts, int& ndim, size_t offset, T* &data) {
-    std::ifstream ifile(filename);
+    std::ifstream ifile(filename, std::ios::binary);
     if (!ifile.is_open()) {
       ERROR("Cannot open file: {}", filename);
       exit(-1);
     }
     ifile.seekg(offset, std::ios::beg);
-    ifile.read((char*)&npts, sizeof(int));
-    ifile.read((char*)&ndim, sizeof(int));
+    if (!ifile.read((char*)&npts, sizeof(int)) ||
+        !ifile.read((char*)&ndim, sizeof(int)) || npts <= 0 || ndim <= 0) {
+      throw std::runtime_error("Invalid or truncated bin header: " + filename +
+                               " at offset " + std::to_string(offset));
+    }
+    if ((size_t)npts > std::numeric_limits<size_t>::max() / (size_t)ndim) {
+      throw std::runtime_error("Bin dimensions overflow: " + filename);
+    }
     size_t len = (size_t)npts * ndim;
-    data = new T [len];
-    ifile.read((char*)data, sizeof(T) * len);
+    auto payload_start = ifile.tellg();
+    ifile.seekg(0, std::ios::end);
+    auto file_end = ifile.tellg();
+    if (payload_start < 0 || file_end < payload_start ||
+        len > (uint64_t)(file_end - payload_start) / sizeof(T)) {
+      throw std::runtime_error("Truncated bin payload: " + filename);
+    }
+    ifile.seekg(payload_start);
+    std::unique_ptr<T[]> loaded(new T[len]);
+    if (!ifile.read((char*)loaded.get(), sizeof(T) * len)) {
+      throw std::runtime_error("Failed to read bin payload: " + filename);
+    }
+    data = loaded.release();
     DEBUG("Read {} x {} data from file: {}", npts, ndim, filename);
   }
 }

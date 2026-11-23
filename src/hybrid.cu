@@ -140,7 +140,7 @@ namespace gustann {
     std::atomic<int> cur(0);
     //cur = 56521;
     auto worker = [&](int threadid) {
-      bind_core(threadid * 2 + 21);
+      bind_core(threadid);
 
       bool finished = false;
       int tot_task = 0;
