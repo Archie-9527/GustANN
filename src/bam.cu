@@ -14,6 +14,7 @@
 #include "common_cuda.cuh"
 #include "nav_graph.hpp"
 #include "bam.hpp"
+#include "page_cache.h"
 #include "ssd_search.hpp"
 //#include "ssd_search_kernel.hpp"
 
@@ -112,7 +113,6 @@ namespace gustann {
     CHECK_CUDA(cudaDeviceSynchronize());
     double end = elapsed();
     CHECK_CUDA(cudaFreeHost(buff));
-    f__k<<<1, 1>>>(bam_data_.a->d_array_ptr);
     DEBUG("finish copy, bandwidth = {} GB/s", 1. * layout_.num_pages * page_size_ / 1024 / 1024 / 1024 / (end - start));
     fclose(input);
 

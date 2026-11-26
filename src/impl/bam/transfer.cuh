@@ -3,6 +3,12 @@
 #include "page_cache.h"
 
 namespace gustann {
+#if __has_include(<simt/atomic>)
+  constexpr auto bam_queue_memory_order = simt::memory_order_relaxed;
+#else
+  constexpr auto bam_queue_memory_order = cuda::std::memory_order_relaxed;
+#endif
+
   template <class T>
   __global__ void copy_data_to_ssd(array_d_t<T> *dest, T *src,
                                    size_t len, size_t offset) {
@@ -46,7 +52,7 @@ namespace gustann {
         uint64_t dest_page = start_lba + i;
         uint32_t ctrl = dest_page % n_ctrls;
         uint32_t block = dest_page / n_ctrls;
-        uint32_t queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %
+        uint32_t queue = ctrls[ctrl]->queue_counter.fetch_add(1, bam_queue_memory_order) %
           (ctrls[ctrl]->n_qps);
         
         QueuePair *qp = &ctrls[ctrl]->d_qps[queue];
@@ -79,7 +85,7 @@ namespace gustann {
         uint64_t dest_page = start_lba + i;
         uint32_t ctrl = dest_page % n_ctrls;
         uint32_t block = dest_page / n_ctrls;
-        uint32_t queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %
+        uint32_t queue = ctrls[ctrl]->queue_counter.fetch_add(1, bam_queue_memory_order) %
           (ctrls[ctrl]->n_qps);
         write_data(pc, (ctrls[ctrl]->d_qps) + queue, block * pc->n_blocks_per_page,
                    pc->n_blocks_per_page, cache_idx);
@@ -87,11 +93,6 @@ namespace gustann {
       }
     }
 #endif
-  }
-
-  __global__ void f__k(array_d_t<uint8_t>* a) {
-    int x = 159494;
-    printf("%x %x %x %x\n", (*a)[x * 4096 + 128 * 4], (*a)[x * 4096 + 128 * 4 + 1], (*a)[x * 4096 + 128 * 4 + 2], (*a)[x * 4096 + 128 * 4 + 3]);
   }
 
   __global__ void fetch_all_data(array_d_t<uint8_t>* a, int num_pages) {

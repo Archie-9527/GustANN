@@ -10,7 +10,9 @@ project(
   Test
   LANGUAGES CXX)
 
-set(CMAKE_CUDA_ARCHITECTURES "80;90" CACHE STRING "CUDA GPU architectures")
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+  set(CMAKE_CUDA_ARCHITECTURES "80;90")
+endif()
 
 enable_language(CUDA)
 enable_language(C)

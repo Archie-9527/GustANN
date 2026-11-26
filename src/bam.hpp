@@ -4,15 +4,20 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "bam_config.hpp"
-#include "page_cache.h"
-#include "page_manager.hpp"
 
 #include "layout.hpp"
 #include "pq_search.hpp"
 #include "common.hpp"
 #include "nav_graph.hpp"
+
+struct Controller;
+struct page_cache_t;
+template <class T> struct range_t;
+template <class T> struct range_d_t;
+template <class T> struct array_t;
 
 namespace gustann {
   struct GustANNStats;
