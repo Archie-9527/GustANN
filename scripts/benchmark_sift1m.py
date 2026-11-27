@@ -200,16 +200,34 @@ def parse_gustann(log, scenario, search):
     if (int(ef), int(queries)) != (search, BATCH):
         raise ValueError(f'expected L={search} and batch={BATCH}, received {ef} and {queries}')
     io_size = SIMULATED.get(scenario, 4096)
-    if int(reads) <= 0 or int(read_bytes) != int(reads) * io_size:
-        raise ValueError(f'no reads or unexpected primary read size for {scenario}')
+    primary_commands = int(reads)
+    primary_bytes = int(read_bytes)
+    io_counter = 'gustann_application'
     if scenario in SIMULATED:
         expected = f'BaM I/O: {io_size} bytes, {io_size // 512} LBA(s) of 512 bytes'
         supplemental = ', 1 LBA per supplemental READ'
         if expected not in log or supplemental not in log or int(extra_bytes) != int(extras) * 512:
             raise ValueError(f'{scenario} did not report the expected namespace LBA and I/O sizes')
-    return dict(batch_seconds=float(seconds), recall=float(recall), primary_read_commands=int(reads),
-                primary_read_bytes=int(read_bytes), extra_read_commands=int(extras),
-                extra_read_bytes=int(extra_bytes), result_hash=result_hash, io_counter='gustann_application')
+        if primary_commands == primary_bytes == 0:
+            # Older binaries read the initialization range instead of the range updated by the kernel.
+            _, timing, after_search = log.rpartition('Use time:')
+            counters = re.findall(r'^#READ IOs:[ \t]*(\d+)[^\n]*#Misses:[ \t]*(\d+)[^\n]*CLSize:[ \t]*(\d+)[ \t]*$',
+                                  after_search, re.MULTILINE) if timing else []
+            if len(counters) == 1:
+                logged_reads, misses, logged_page_size = map(int, counters[0])
+                if logged_reads == misses > 0 and logged_page_size == io_size:
+                    primary_commands = logged_reads
+                    primary_bytes = logged_reads * io_size
+                    io_counter = 'bam_cache_misses'
+                    print(f'{scenario} L={search}: structured primary counters are zero. '
+                          f'Using {logged_reads} primary reads from the post-search BaM cache counters.',
+                          file=sys.stderr)
+    if primary_commands <= 0 or primary_bytes != primary_commands * io_size:
+        raise ValueError(f'{scenario} reported {primary_commands} primary reads and {primary_bytes} primary bytes. '
+                         f'Expected a positive read count and {io_size} bytes per primary read.')
+    return dict(batch_seconds=float(seconds), recall=float(recall), primary_read_commands=primary_commands,
+                primary_read_bytes=primary_bytes, extra_read_commands=int(extras),
+                extra_read_bytes=int(extra_bytes), result_hash=result_hash, io_counter=io_counter)
 
 
 def summarize_row(scenario, search, trials):
