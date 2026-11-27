@@ -6,6 +6,8 @@
 namespace gustann {
 
 // TODO: enhance it by adding custom node_id -> (blk_id, offset) functions.
+inline constexpr int DISKANN_PAGE_SIZE = 4096;
+
 struct Layout {
   int64_t num_dims; // # of vector dimension
   int64_t max_m0; // # of neighbors

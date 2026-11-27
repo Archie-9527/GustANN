@@ -11,9 +11,11 @@ endif()
 
 if (GUSTANN_USE_URING)
   message("include io_uring Backend")
+  find_path(LIBURING_INCLUDE_DIR liburing.h HINTS "${CMAKE_SOURCE_DIR}/deps/liburing/src/include" REQUIRED)
+  find_library(LIBURING_LIBRARY uring HINTS "${CMAKE_SOURCE_DIR}/deps/liburing/src" REQUIRED)
   target_sources(index_loader PRIVATE io_uring.cpp)
-  target_include_directories(index_loader PUBLIC ${CMAKE_SOURCE_DIR}/deps/liburing/src/include)
-  target_link_libraries(index_loader PUBLIC ${CMAKE_SOURCE_DIR}/deps/liburing/src/liburing.a)
+  target_include_directories(index_loader PRIVATE "${LIBURING_INCLUDE_DIR}")
+  target_link_libraries(index_loader PUBLIC "${LIBURING_LIBRARY}")
   target_compile_definitions(index_loader PUBLIC "USE_URING")
 endif()
 

@@ -15,7 +15,7 @@ namespace gustann {
     search_disk_graph_kernel
     (DiskData* data, float* qdata, const int num_dims,
      PQSearchData* pq_data,
-     int nodes_per_page, int node_len, int data_len,
+     int nodes_per_page, int node_len, int data_len, int io_page_size,
      int* entries,
      const int max_m, const int ef_search, const int topk,
      //uint32_t* neighbor_id, float* neighbor_dist,
@@ -31,14 +31,16 @@ namespace gustann {
     pager.node_len = node_len;
     pager.disk = data;
     pager.data_len = data_len;
+    pager.page_size = io_page_size;
     pager.init();
 
-    extern __shared__ uint8_t shm_pool[];
-    int* mv_pos = (int*) shm_pool;
+    extern __shared__ int shm_pool[];
+    int* mv_pos = shm_pool;
     uint32_t* mv_id = (uint32_t*)(mv_pos + ef_search + max_m);
     float* mv_dist = (float*)(mv_id + ef_search + max_m);
     uint32_t* tmp_id = (uint32_t*)(mv_dist + ef_search + max_m);
     float* tmp_dist = (float*)(tmp_id + ef_search + max_m);
+    uint8_t* node_scratch = reinterpret_cast<uint8_t*>(tmp_dist + ef_search + max_m);
     
     ReadCtx ctx;
     static __shared__ GraphData<T> graph;
@@ -54,7 +56,7 @@ namespace gustann {
       
       while(u != -1) {
         if (tid == 0) {
-          graph = pager.get_graph<T>(u, ctx);
+          graph = pager.get_graph<T>(u, ctx, node_scratch);
         }
         __syncthreads();
         int sz = ctx_size;

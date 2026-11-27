@@ -10,6 +10,7 @@ struct BaMConfig {
   int nvm_namespace = 1;
   int page_size = 4096;
   int num_page = 1024;
+  bool simulator_mode = false;
   bool use_simple_cache = false;
 };
 

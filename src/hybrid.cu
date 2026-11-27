@@ -297,6 +297,8 @@ namespace gustann {
     INFO("Use time: {}", end - start);
     if (stats) {
       stats->run_time = end - start;
+      stats->read_commands = tot_reads.load();
+      stats->read_bytes = stats->read_commands * PAGE_SIZE;
     }
     INFO("Total reads: {}", tot_reads.load());
     REPORT("Time %lf", end - start);

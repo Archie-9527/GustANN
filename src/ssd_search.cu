@@ -83,8 +83,9 @@ namespace gustann {
   void GustANN::init_bam(const GustANNConfig& gustann_config, const BaMConfig& bam_config, bool copy) {
 
     init_gustann_internal(gustann_config);
-    DEBUG("{} {}", layout_.node_size * layout_.nodes_per_page, bam_config.page_size);
-    ASSERT(layout_.node_size * layout_.nodes_per_page <= bam_config.page_size);
+    ASSERT(layout_.nodes_per_page > 0 && layout_.node_size > 0);
+    ASSERT(layout_.node_size * layout_.nodes_per_page <= DISKANN_PAGE_SIZE);
+    ASSERT(layout_.max_m0 > 0 && layout_.max_m0 <= 128);
 
     search_type = BAM;
     search_executor_.bam = new BaMExecutor(gustann_config.index_file, layout_, data_type_, bam_config, copy);

@@ -23,7 +23,11 @@ namespace gustann {
   };
 
   struct GustANNStats {
-    double run_time;
+    double run_time = 0;
+    uint64_t read_commands = 0;
+    uint64_t read_bytes = 0;
+    uint64_t extra_read_commands = 0;
+    uint64_t extra_read_bytes = 0;
   };
   
   class GustANN {

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <numeric>
 
 #include <thrust/copy.h>
@@ -50,76 +51,58 @@ namespace gustann {
   }
 
   void BaMExecutor::copy_to_bam(const std::string &fpath) {
-    DEBUG("start copy, total page {}", layout_.num_pages);
-    //std::ifstream input(fpath, std::ios::binary);
-    FILE* input = fopen(fpath.c_str(), "rb");
-    if (!input) {
-      ERROR("Failed to open file: {}", fpath);
-      exit(-1);
+    FILE* input = std::fopen(fpath.c_str(), "rb");
+    if (!input || std::fseek(input, DISKANN_PAGE_SIZE, SEEK_SET) != 0) {
+      ERROR("Cannot open DiskANN graph data in {}", fpath);
+      exit(EXIT_FAILURE);
     }
-    uint8_t* buff;
 
-    uint64_t copy_block_cnt = 112 * 4;
-    uint64_t copy_batch = 1000 * 1024 / 4 / copy_block_cnt;
-    uint64_t copy_pages = copy_block_cnt * copy_batch; // 100MB
-
-    /*
-      {
-      input.seekg(0, std::ios::end);      
-      auto pos = input.tellg();
-      uint64_t len = pos;
-      DEBUG("Len: {}", len);
+    const uint64_t data_pages = layout_.num_pages * DISKANN_PAGE_SIZE / page_size_;
+    const uint64_t batch_pages = std::min<uint64_t>(data_pages, 64 * 1024 * 1024 / page_size_);
+    const uint64_t copy_blocks = std::min<uint64_t>(112 * 4, bam_data_.h_pc->pdt.n_pages);
+    uint8_t* buffer;
+    CHECK_CUDA(cudaMallocHost(&buffer, batch_pages * page_size_));
+    const double start = elapsed();
+    for (uint64_t i = 0; i < data_pages; i += batch_pages) {
+      const uint64_t count = std::min(batch_pages, data_pages - i);
+      if (std::fread(buffer, page_size_, count, input) != count) {
+        ERROR("Truncated DiskANN graph data in {} at BaM page {}", fpath, i);
+        exit(EXIT_FAILURE);
       }
-    */
-    CHECK_CUDA(cudaMallocHost(&buff, page_size_ * copy_pages));
-    fseek(input, page_size_, SEEK_SET);
-    //input.seekg(page_size_, std::ios::beg);
-    CHECK_CUDA(cudaDeviceSynchronize());
-    double start = elapsed();
-
-    uint64_t tot_cnt = 0;
-    int gb_cnt = 1;
-    for (int64_t i = 0; i < layout_.num_pages; i += copy_pages) {
-      // readsome may cause problems when reading large datasets
-      // https://bugzilla.redhat.com/show_bug.cgi?id=1122595
-      //size_t size = input.readsome((char*) buff, copy_pages * page_size_);
-      size_t size = fread((char*) buff, sizeof(char), copy_pages * page_size_, input);
-      //copy_data_to_ssd<<<copy_block_cnt, block_dim_>>>
-      //  (bam_data_.a->d_array_ptr, buff, size, page_size_ * i);
-      copy_page_to_ssd<<<copy_block_cnt, block_dim_>>>
-        (bam_data_.h_pc->pdt.d_ctrls, bam_data_.h_pc->d_pc_ptr,
-         bam_data_.ctrls.size(), buff, i, (size + page_size_ - 1) / page_size_, page_size_);
-
-      auto pos = ftell(input);
-            
-      tot_cnt += (size + page_size_ - 1) / page_size_;
-      if (tot_cnt >= gb_cnt * 10ll * 1024 * 1024 * 1024 / page_size_) {
-        DEBUG("{} GB Copied", tot_cnt * page_size_ / 1024 / 1024 / 1024);
-        gb_cnt++;
-      }
+      copy_page_to_ssd<<<copy_blocks, block_dim_>>>(
+          bam_data_.h_pc->pdt.d_ctrls, bam_data_.h_pc->d_pc_ptr,
+          bam_data_.ctrls.size(), buffer, i, count, page_size_);
       CHECK_CUDA(cudaDeviceSynchronize());
-      /*
-        if (i <= 159494 && 159494 < i + block_cnt_) {
-        int a = 159494 - i;
-        printf("%d\n", *(int*)(buff + a * 4096 + 128 * 4));
-        }
-      */
     }
-    DEBUG("{} {}", tot_cnt, layout_.num_pages);
-    ASSERT((tot_cnt == layout_.num_pages));
 #ifdef ASYNC_READ
     bam_data_.h_pc->clear_cache();
-#endif
     CHECK_CUDA(cudaDeviceSynchronize());
-    double end = elapsed();
-    CHECK_CUDA(cudaFreeHost(buff));
-    DEBUG("finish copy, bandwidth = {} GB/s", 1. * layout_.num_pages * page_size_ / 1024 / 1024 / 1024 / (end - start));
-    fclose(input);
-
+#endif
+    CHECK_CUDA(cudaFreeHost(buffer));
+    std::fclose(input);
+    INFO("Copied {} graph bytes to BaM in {:.3f} s", data_pages * page_size_, elapsed() - start);
   }
 
   void BaMExecutor::init(const BaMConfig &config) {
-    int64_t ssd_pages = layout_.num_pages;
+    if (config.page_size != 512 && config.page_size != DISKANN_PAGE_SIZE) {
+      ERROR("BaM I/O size must be 512 or {} bytes", DISKANN_PAGE_SIZE);
+      exit(EXIT_FAILURE);
+    }
+    if (config.num_ctrls < 1 || config.num_ctrls > sizeof(ctrls_paths) / sizeof(ctrls_paths[0]) ||
+        ((config.page_size == 512 || config.simulator_mode) && config.num_ctrls != 1)) {
+      ERROR("Invalid BaM controller count {} for the selected mode", config.num_ctrls);
+      exit(EXIT_FAILURE);
+    }
+    if (config.num_page <= 0) {
+      ERROR("BaM cache page count must be positive");
+      exit(EXIT_FAILURE);
+    }
+    if (config.num_queues <= 0 || config.num_queues > UINT16_MAX) {
+      ERROR("BaM I/O queue count must be between 1 and {}", UINT16_MAX);
+      exit(EXIT_FAILURE);
+    }
+    const uint64_t data_size = layout_.num_pages * DISKANN_PAGE_SIZE;
+    const uint64_t ssd_pages = data_size / config.page_size;
     for (int i = 0; i < config.num_ctrls; i++) {
       bam_data_.ctrls.push_back
         (new Controller(ctrls_paths[i],
@@ -127,9 +110,20 @@ namespace gustann {
                         config.cuda_device,
                         config.queue_depth,
                         config.num_queues));
+      const auto lba_size = bam_data_.ctrls.back()->blk_size;
+      if (lba_size == 0 || config.page_size % lba_size != 0 ||
+          lba_size != bam_data_.ctrls.front()->blk_size ||
+          (config.simulator_mode && lba_size != 512)) {
+        ERROR("BaM I/O size {} is incompatible with namespace LBA size {} on {}",
+              config.page_size, lba_size, ctrls_paths[i]);
+        exit(EXIT_FAILURE);
+      }
+      const uint64_t controller_pages = (ssd_pages + config.num_ctrls - 1 - i) / config.num_ctrls;
+      if (controller_pages > bam_data_.ctrls.back()->ns.size / (config.page_size / lba_size)) {
+        ERROR("The DiskANN graph data exceeds the namespace size on {}", ctrls_paths[i]);
+        exit(EXIT_FAILURE);
+      }
     }
-    
-    int ele_per_page = config.page_size;  
     
     int num_pages = config.num_page;
     
@@ -143,9 +137,9 @@ namespace gustann {
                                       bam_data_.ctrls[0][0],
                                       64,
                                       bam_data_.ctrls);
-    int64_t data_size = ssd_pages * config.page_size;
-
     page_size_ = config.page_size;
+    INFO("BaM I/O: {} bytes, {} LBA(s) of {} bytes, {} GPU cache slots, 1 LBA per supplemental READ",
+         page_size_, bam_data_.h_pc->pdt.n_blocks_per_page, bam_data_.ctrls.front()->blk_size, num_pages);
 
     if (config.use_simple_cache) {
       this->use_simple_cache = true;
@@ -171,10 +165,11 @@ namespace gustann {
       ERROR("Failed to open file: {}", fpath);
       exit(-1);
     }
-    fseek(input, page_size_, SEEK_SET);
-    CHECK_CUDA(cudaHostAlloc(&mem_data_, layout_.num_pages * page_size_, cudaHostAllocPortable));
+    fseek(input, DISKANN_PAGE_SIZE, SEEK_SET);
+    CHECK_CUDA(cudaHostAlloc(&mem_data_, layout_.num_pages * DISKANN_PAGE_SIZE, cudaHostAllocPortable));
     uint8_t* mem_data_host = mem_data_; //new uint8_t[num_pages_ * page_size_];
-    ASSERT(fread(mem_data_host, 1, layout_.num_pages * page_size_, input) == layout_.num_pages * page_size_);
+    ASSERT(fread(mem_data_host, 1, layout_.num_pages * DISKANN_PAGE_SIZE, input) ==
+           layout_.num_pages * DISKANN_PAGE_SIZE);
     //CHECK_CUDA(cudaMalloc(&mem_data_, num_pages_ * page_size_));
     //CHECK_CUDA(cudaMemcpy(mem_data_, mem_data_host, num_pages_ * page_size_, cudaMemcpyHostToDevice));
     fclose(input);
@@ -213,6 +208,11 @@ namespace gustann {
       throw;
     }
     bam_data_.a->print_reset_stats();
+    uint64_t extra_reads_before = 0;
+    if (stats) {
+      CHECK_CUDA(cudaMemcpy(&extra_reads_before, bam_data_.h_pc->pdt.extra_reads,
+                            sizeof(extra_reads_before), cudaMemcpyDeviceToHost));
+    }
     CHECK_CUDA(cudaDeviceSynchronize());
     double start = elapsed();
 
@@ -252,9 +252,11 @@ namespace gustann {
       break;
     }
 #pragma GCC diagnostics pop
+    const size_t scratch_bytes = page_size_ == DISKANN_PAGE_SIZE ? 0 : layout_.node_size + alignof(int) - 1;
+    const int search_threads = std::max<int>(64, (layout_.max_m0 + 31) / 32 * 32);
     kernel_func<<<
-      block_cnt_, (layout_.max_m0 + 31) / 32 * 32,
-      (sizeof(int) * 3 + sizeof(float) * 2) * (ef_search + layout_.max_m0)
+      block_cnt_, search_threads,
+      (sizeof(int) * 3 + sizeof(float) * 2) * (ef_search + layout_.max_m0) + scratch_bytes
         >>>
       (
 #ifdef _USE_MEM
@@ -265,7 +267,7 @@ namespace gustann {
         thrust::raw_pointer_cast(d_qdata.data()),
         layout_.num_dims,
         pq->get_device_ptr(),
-        layout_.nodes_per_page, layout_.node_size, layout_.data_size,
+        layout_.nodes_per_page, layout_.node_size, layout_.data_size, page_size_,
         thrust::raw_pointer_cast(d_entries.data()),
         layout_.max_m0, ef_search, topk,
         thrust::raw_pointer_cast(d_nns.data()), 
@@ -281,6 +283,15 @@ namespace gustann {
     INFO("Use time: {}", end - start);
     if (stats) {
       stats->run_time = end - start;
+      range_d_t<uint8_t> range_stats;
+      CHECK_CUDA(cudaMemcpy(&range_stats, bam_data_.d_range, sizeof(range_stats), cudaMemcpyDeviceToHost));
+      uint64_t extra_reads;
+      CHECK_CUDA(cudaMemcpy(&extra_reads, bam_data_.h_pc->pdt.extra_reads,
+                            sizeof(extra_reads), cudaMemcpyDeviceToHost));
+      stats->read_commands = range_stats.miss_cnt;
+      stats->read_bytes = stats->read_commands * page_size_;
+      stats->extra_read_commands = extra_reads - extra_reads_before;
+      stats->extra_read_bytes = stats->extra_read_commands * bam_data_.ctrls.front()->blk_size;
     }
     std::vector<int64_t> acc_visited_cnt(block_cnt_);
     thrust::copy(d_nns.begin(), d_nns.end(), nns);

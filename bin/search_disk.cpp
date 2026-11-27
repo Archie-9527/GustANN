@@ -2,6 +2,7 @@
 
 #include "ssd_search.hpp"
 #include "spdlog/spdlog.h"
+#include <cinttypes>
 #include <set>
 #include "fstream"
 #include "utils.hpp"
@@ -21,6 +22,7 @@ int main(int argc, char **argv) {
   
   bool copy_data = false;
   bool only_copy = false;
+  bool benchmark = false;
   std::string query_file ;
   std::string gt_file;
   std::string data_type;
@@ -46,6 +48,11 @@ int main(int argc, char **argv) {
   program.add_argument("--num_ctrls").store_into(bam_config.num_ctrls);
   program.add_argument("--copy_data").store_into(copy_data);
   program.add_argument("--cache_page").store_into(bam_config.num_page);
+  program.add_argument("--bam-io-size").help("BaM search read size in bytes: 512 or 4096")
+      .store_into(bam_config.page_size);
+  program.add_argument("--bam-queues").store_into(bam_config.num_queues);
+  program.add_argument("--bam-sim").help("Require one controller with a 512-byte LBA namespace")
+      .store_into(bam_config.simulator_mode);
   program.add_argument("--copy_only").store_into(only_copy);
 #endif
   program.add_argument("--query").required().store_into(query_file);
@@ -57,6 +64,8 @@ int main(int argc, char **argv) {
   program.add_argument("--pq_data").required().store_into(search_config.pq_file_prefix);
   program.add_argument("--nav_graph").store_into(search_config.nav_graph_prefix);
   program.add_argument("--repeat", "-R").store_into(repeat);
+  program.add_argument("--benchmark").help("Print one machine-readable result per search batch")
+      .store_into(benchmark);
   
 #ifdef HYBRID_CALC
   program.add_argument("--minibatch", "-B").required().store_into(batch);
@@ -189,6 +198,40 @@ int main(int argc, char **argv) {
   ASSERT(ef_searches.size() > 0);
   for (auto ef_search : ef_searches) {
     ASSERT(ef_search >= topk);
+  }
+
+  if (benchmark) {
+    if (gt_file.empty()) {
+      ERROR("--benchmark requires --ground_truth");
+      return 1;
+    }
+    size_t gt_d, gt_nq;
+    std::unique_ptr<int[]> gt(ivecs_read(gt_file.c_str(), &gt_d, &gt_nq));
+    if (gt_nq != nq || gt_d < topk) {
+      ERROR("Ground truth must contain {} query rows and at least {} IDs per row", nq, topk);
+      return 1;
+    }
+    for (int ef_search : ef_searches) {
+      gustann::GustANNStats stats;
+      a.search(data, nq, topk, ef_search, nns.get(), dis.get(), found_cnt.get(), &stats);
+      uint64_t result_hash = UINT64_C(14695981039346656037);
+      for (size_t q = 0; q < nq; ++q) {
+        if (found_cnt[q] != topk) {
+          ERROR("Query {} returned {} results, expected {}", q, found_cnt[q], topk);
+          return 1;
+        }
+        for (int k = 0; k < topk; ++k) {
+          result_hash ^= static_cast<uint32_t>(nns[q * topk + k]);
+          result_hash *= UINT64_C(1099511628211);
+        }
+      }
+      const double recall = calc_recall(nns.get(), gt.get(), nq, gt_d, topk);
+      printf("GUSTANN_BENCH %d %zu %.9f %.8f %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %016" PRIx64 "\n",
+             ef_search, nq, stats.run_time, recall, stats.read_commands, stats.read_bytes,
+             stats.extra_read_commands, stats.extra_read_bytes, result_hash);
+    }
+    delete[] data;
+    return 0;
   }
 
   if (ef_searches.size() == 1) {
