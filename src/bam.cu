@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <numeric>
+#include <thread>
 
 #include <thrust/copy.h>
 #include <thrust/fill.h>
@@ -30,6 +33,32 @@
 namespace gustann {
 
   const char *const ctrls_paths[6] = {"/dev/libnvm0","/dev/libnvm1","/dev/libnvm2","/dev/libnvm3","/dev/libnvm4","/dev/libnvm5"};
+
+  BaMExecutor::BaMContext::~BaMContext() {
+    for (auto* controller : ctrls) {
+      auto* bar = static_cast<volatile char*>(controller->ctrl->mm_ptr);
+      auto* config = reinterpret_cast<volatile uint32_t*>(bar + 0x14);
+      *config &= ~1u;  // Clear NVMe CC.EN before releasing DMA mappings.
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for (auto* controller : ctrls) {
+      const auto timeout = std::chrono::milliseconds(std::max<uint64_t>(1000, controller->ctrl->timeout));
+      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      while (*controller->controller_status() & 1u) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          ERROR("Timed out waiting for BaM controller to stop; DMA mappings were left pinned");
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    delete a;
+    delete h_range;
+    delete h_pc;
+    for (auto* controller : ctrls) {
+      delete controller;
+    }
+  }
 
   BaMExecutor::BaMExecutor(const std::string &fpath, const Layout &layout,
                            const DataType& data_type,
@@ -151,7 +180,6 @@ namespace gustann {
          0, config.page_size, bam_data_.h_pc,
          config.cuda_device,
          STRIPE);
-      bam_data_.d_range = (range_d_t<uint8_t>*) bam_data_.h_range->d_range_ptr;
       bam_data_.vr.push_back(bam_data_.h_range);
       bam_data_.a = new array_t<uint8_t> (data_size, 0, bam_data_.vr, config.cuda_device);
     }
@@ -284,7 +312,8 @@ namespace gustann {
     if (stats) {
       stats->run_time = end - start;
       range_d_t<uint8_t> range_stats;
-      CHECK_CUDA(cudaMemcpy(&range_stats, bam_data_.d_range, sizeof(range_stats), cudaMemcpyDeviceToHost));
+      // The search kernel updates the range copied into the array at initialization.
+      CHECK_CUDA(cudaMemcpy(&range_stats, bam_data_.a->adt.d_ranges, sizeof(range_stats), cudaMemcpyDeviceToHost));
       uint64_t extra_reads;
       CHECK_CUDA(cudaMemcpy(&extra_reads, bam_data_.h_pc->pdt.extra_reads,
                             sizeof(extra_reads), cudaMemcpyDeviceToHost));

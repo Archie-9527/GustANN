@@ -16,7 +16,6 @@
 struct Controller;
 struct page_cache_t;
 template <class T> struct range_t;
-template <class T> struct range_d_t;
 template <class T> struct array_t;
 
 namespace gustann {
@@ -30,12 +29,12 @@ namespace gustann {
                 PQSearch* pq, NavGraph* nav, GustANNStats* stats = nullptr);
   private:
     struct BaMContext {
+      ~BaMContext();
       std::vector<Controller *> ctrls;
       page_cache_t *h_pc = nullptr;
       range_t<uint8_t> *h_range = nullptr;
       std::vector<range_t<uint8_t> *> vr;
       array_t<uint8_t> *a = nullptr;
-      range_d_t<uint8_t> *d_range = nullptr;
     } bam_data_;
     
     bool use_simple_cache = false;

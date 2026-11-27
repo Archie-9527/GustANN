@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the five SIFT1M search paths using one 10,000-query batch per run."""
+"""Benchmark SIFT1M on the host or on one preconfigured SwarmIO instance per run."""
 
 import argparse
 import json
@@ -15,7 +15,9 @@ REPO = Path(__file__).resolve().parents[1]
 BATCH = 10_000
 TOPK = 10
 RECALL_TARGETS = (0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
-DEFAULT_SCENARIOS = ('diskann', 'libaio', 'liburing', 'bam-4k', 'bam-512')
+DEFAULT_SCENARIOS = ('diskann', 'libaio', 'liburing')
+SIMULATED = {'bam-4k': 4096, 'bam-512': 512}
+SWARMIO_IO_UNIT = Path('/proc/swarmio/io_unit_shift')
 PHYSICAL = 'bam-physical-4k'
 DEFAULT_SEARCH_LIST = (10, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
 INDEX_SUFFIXES = ('_disk.index', '_pq_pivots.bin', '_pq_compressed.bin')
@@ -28,7 +30,8 @@ def arguments():
     parser.add_argument('--index-prefix', type=Path, help='Use or build a float L2 DiskANN index at this prefix')
     parser.add_argument('--gustann-bin-dir', type=Path, default=REPO / 'build/bin')
     parser.add_argument('--diskann-bin-dir', type=Path, default=REPO / 'deps/DiskANN/build/apps')
-    parser.add_argument('--scenarios', nargs='+', choices=(*DEFAULT_SCENARIOS, PHYSICAL), default=DEFAULT_SCENARIOS)
+    parser.add_argument('--scenarios', nargs='+', choices=(*DEFAULT_SCENARIOS, *SIMULATED, PHYSICAL),
+                        default=DEFAULT_SCENARIOS, help='Defaults to host scenarios. Select at most one SwarmIO size.')
     parser.add_argument('--search-list', nargs='+', type=int, default=DEFAULT_SEARCH_LIST)
     parser.add_argument('--trials', type=int, default=1, help='Fresh process and full batch per trial')
     parser.add_argument('--threads', type=int, default=8)
@@ -39,7 +42,7 @@ def arguments():
     parser.add_argument('--bam-queues', type=int, default=135)
     parser.add_argument('--bam-launcher', default='sudo', help='Command prefix for BaM, or an empty string')
     parser.add_argument('--physical-ctrls', type=int, default=1, help='Only used by the deferred physical BaM scenario')
-    parser.add_argument('--load-bam', action='store_true', help='Load the index at LBA 0 before BaM runs')
+    parser.add_argument('--load-bam', action='store_true', help='Load the index at LBA 0 using the selected BaM I/O size')
     parser.add_argument('--dry-run', action='store_true', help='Print commands without building, writing media or running searches')
     args = parser.parse_args()
     if any(value < TOPK for value in args.search_list):
@@ -47,9 +50,13 @@ def arguments():
     if min(args.trials, args.threads, args.beamwidth, args.mini_batch, args.contexts,
            args.cache_mib, args.bam_queues, args.physical_ctrls) <= 0:
         parser.error('counts must be positive')
+    args.scenarios = tuple(dict.fromkeys(args.scenarios))
+    if len(set(args.scenarios) & SIMULATED.keys()) > 1:
+        parser.error('select one SwarmIO instance per run: bam-4k or bam-512')
     if PHYSICAL in args.scenarios and len(args.scenarios) != 1:
         parser.error('run the physical BaM scenario separately, after switching the controller mapping')
-    args.scenarios = tuple(dict.fromkeys(args.scenarios))
+    if args.load_bam and not any(scenario.startswith('bam-') for scenario in args.scenarios):
+        parser.error('--load-bam requires an explicit BaM scenario')
     args.search_list = sorted(set(args.search_list))
     for name in ('sift_dir', 'out_dir', 'gustann_bin_dir', 'diskann_bin_dir', 'index_prefix'):
         value = getattr(args, name)
@@ -72,7 +79,10 @@ def run(command, log, dry_run):
         result = subprocess.run(argv, stdout=transcript, stderr=subprocess.STDOUT, check=False)
     if result.returncode:
         raise RuntimeError(f'exit {result.returncode}; see {log}')
-    return log.read_text(encoding='utf-8', errors='replace')
+    output = log.read_text(encoding='utf-8', errors='replace')
+    if 'Timed out waiting for BaM controller to stop' in output:
+        raise RuntimeError(f'BaM controller did not stop; see {log}')
+    return output
 
 
 def convert_vecs(source, destination, expected_rows, expected_dim=None, min_dim=1):
@@ -114,7 +124,22 @@ def prepare_index(args):
         raise RuntimeError(f'build did not produce the three expected files at {args.index_prefix}')
 
 
-def gustann_command(args, scenario, search=None, io_size=None):
+def check_swarmio_size(scenario):
+    expected = SIMULATED[scenario].bit_length() - 1
+    try:
+        reported = SWARMIO_IO_UNIT.read_text(encoding='ascii').strip()
+    except (FileNotFoundError, PermissionError):
+        print(f'{scenario}: cannot read {SWARMIO_IO_UNIT}; using the operator-selected instance size',
+              file=sys.stderr)
+        return None
+    if reported != str(expected):
+        raise ValueError(f'{scenario} requires SwarmIO io_unit_shift={expected}, but {SWARMIO_IO_UNIT} '
+                         f'reports {reported!r}. Create the matching instance and retry.')
+    print(f'{scenario}: verified SwarmIO io_unit_shift={reported}', flush=True)
+    return expected
+
+
+def gustann_command(args, scenario, search=None):
     bam = scenario.startswith('bam-')
     binary = 'search_disk' if bam else 'search_disk_hybrid'
     command = shlex.split(args.bam_launcher) if bam else []
@@ -122,8 +147,7 @@ def gustann_command(args, scenario, search=None, io_size=None):
                 '--index', f'{args.index_prefix}_disk.index', '--pq_data', f'{args.index_prefix}_pq',
                 '--query', args.sift_dir / 'sift_query.fvecs']
     if bam:
-        if io_size is None:
-            io_size = 512 if scenario == 'bam-512' else 4096
+        io_size = SIMULATED.get(scenario, 4096)
         controllers = args.physical_ctrls if scenario == PHYSICAL else 1
         cache_pages = args.cache_mib * (1 << 20) // io_size
         command += ['--num_ctrls', controllers, '--cache_page', cache_pages,
@@ -175,10 +199,10 @@ def parse_gustann(log, scenario, search):
     ef, queries, seconds, recall, reads, read_bytes, extras, extra_bytes, result_hash = rows[0]
     if (int(ef), int(queries)) != (search, BATCH):
         raise ValueError(f'expected L={search} and batch={BATCH}, received {ef} and {queries}')
-    io_size = 512 if scenario == 'bam-512' else 4096
+    io_size = SIMULATED.get(scenario, 4096)
     if int(reads) <= 0 or int(read_bytes) != int(reads) * io_size:
         raise ValueError(f'no reads or unexpected primary read size for {scenario}')
-    if scenario in ('bam-4k', 'bam-512'):
+    if scenario in SIMULATED:
         expected = f'BaM I/O: {io_size} bytes, {io_size // 512} LBA(s) of 512 bytes'
         supplemental = ', 1 LBA per supplemental READ'
         if expected not in log or supplemental not in log or int(extra_bytes) != int(extras) * 512:
@@ -207,6 +231,8 @@ def summarize_row(scenario, search, trials):
     if scenario == 'diskann':
         for metric in ('query_mean_ms', 'query_p999_ms'):
             result[metric] = statistics.median(t[metric] for t in trials)
+    if scenario in SIMULATED:
+        result['simulator_io_unit_shift'] = trials[0]['simulator_io_unit_shift']
     return result
 
 
@@ -230,6 +256,10 @@ def write_results(out_dir, scenarios, rows):
 
 def main():
     args = arguments()
+    bam_scenario = next((scenario for scenario in args.scenarios if scenario.startswith('bam-')), None)
+    simulator_shift = None
+    if bam_scenario in SIMULATED and not args.dry_run:
+        simulator_shift = check_swarmio_size(bam_scenario)
     truth = None
     if not args.dry_run:
         args.out_dir.mkdir(parents=True)
@@ -242,12 +272,10 @@ def main():
             _, width = struct.unpack_from('<II', matrix)
             truth = [set(struct.unpack_from('<' + 'I' * TOPK, matrix, 8 + 4 * width * i)) for i in range(BATCH)]
     prepare_index(args)
-    bam_scenarios = [scenario for scenario in args.scenarios if scenario.startswith('bam-')]
-    if args.load_bam and bam_scenarios:
-        run(gustann_command(args, bam_scenarios[0], io_size=4096), args.out_dir / 'bam_load.log', args.dry_run)
+    if args.load_bam:
+        run(gustann_command(args, bam_scenario), args.out_dir / 'bam_load.log', args.dry_run)
 
     rows = []
-    bam_hashes = {}
     for scenario in args.scenarios:
         for search in args.search_list:
             trials = []
@@ -265,15 +293,12 @@ def main():
                         raise ValueError('invalid search time or recall')
                 except (ValueError, ZeroDivisionError) as exc:
                     raise ValueError(f'{stem.with_suffix(".log")}: {exc}') from exc
+                if scenario in SIMULATED:
+                    record['simulator_io_unit_shift'] = simulator_shift
                 trials.append(record)
                 with (args.out_dir / 'measurements.jsonl').open('a', encoding='utf-8') as raw:
                     raw.write(json.dumps(dict(scenario=scenario, search_list=search, trial=trial, **record),
                                          allow_nan=False) + '\n')
-                if scenario in ('bam-4k', 'bam-512'):
-                    key = (search, trial)
-                    observed = record['result_hash']
-                    if bam_hashes.setdefault(key, observed) != observed:
-                        raise ValueError(f'BaM top-10 ID mismatch between 4 KiB and 512 B at L={search}, trial={trial}')
             if trials:
                 rows.append(summarize_row(scenario, search, trials))
     if not args.dry_run:

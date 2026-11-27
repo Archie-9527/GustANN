@@ -3,6 +3,7 @@
 #include "ssd_search.hpp"
 #include "spdlog/spdlog.h"
 #include <cinttypes>
+#include <exception>
 #include <set>
 #include "fstream"
 #include "utils.hpp"
@@ -150,7 +151,12 @@ int main(int argc, char **argv) {
   hybrid_config.ssd_lists = ssd_lists;
   a.init_hybrid(search_config, hybrid_config);
 #elif defined(_USE_BAM)
-  a.init_bam(search_config, bam_config, copy_data);
+  try {
+    a.init_bam(search_config, bam_config, copy_data);
+  } catch (const std::exception& error) {
+    ERROR("BaM initialization failed: {}", error.what());
+    return 1;
+  }
   if (only_copy) return 0;
 #elif defined(USE_PURE_MEM)
   a.init_pure_mem(search_config, use_gpu_mem);

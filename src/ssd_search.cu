@@ -87,8 +87,8 @@ namespace gustann {
     ASSERT(layout_.node_size * layout_.nodes_per_page <= DISKANN_PAGE_SIZE);
     ASSERT(layout_.max_m0 > 0 && layout_.max_m0 <= 128);
 
-    search_type = BAM;
     search_executor_.bam = new BaMExecutor(gustann_config.index_file, layout_, data_type_, bam_config, copy);
+    search_type = BAM;
     
     DEBUG("Initialization finished");
   }

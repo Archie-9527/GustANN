@@ -41,9 +41,11 @@ Most of the arguments are the same as original GustANN, here lists the differenc
 
 ## SIFT1M 功能与性能对比
 
-`scripts/benchmark_sift1m.py` 默认测试 DiskANN、GustANN libaio、GustANN liburing、GustANN BaM 仿真盘 4 KiB 和 512 B。前三组读取同一个主机文件系统上的索引，BaM 两组读取同一个仿真盘上的数据区。两组 BaM 默认使用同样的 64 MiB GPU 缓存数据容量。
+`scripts/benchmark_sift1m.py` 默认测试 DiskANN、GustANN libaio 和 GustANN liburing，三组读取同一个主机文件系统上的索引。BaM 仿真盘测试需要显式选择 `bam-4k` 或 `bam-512`，一次运行只接受一种仿真粒度。两组 BaM 默认使用同样的 64 MiB GPU 缓存数据容量。
 
 在 Linux CUDA 主机上构建。BaM 的内核模块和 `deps/bam/build/lib/libnvm.so` 需要提前准备。构建 GustANN 时也需要安装 libaio 和 liburing 的开发库。
+
+在新 BaM checkout 上应用 `git -C deps/bam apply ../bam-cleanup.patch` 后再编译。补丁修正页缓存析构和内核 DMA 映射失败的清理。使用已应用补丁的 checkout 时直接编译。升级已加载的 `libnvm` 内核模块需要安排维护窗口。
 
 ```bash
 cmake -S deps/DiskANN -B deps/DiskANN/build -DCMAKE_BUILD_TYPE=Release
@@ -52,19 +54,27 @@ cmake -S . -B build -DGUSTANN_USE_BAM=ON -DGUSTANN_USE_AIO=ON -DGUSTANN_USE_URIN
 cmake --build build --target search_disk search_disk_hybrid -j
 ```
 
-SIFT1M 目录放置 `sift_base.fvecs`、`sift_query.fvecs` 和 `sift_groundtruth.ivecs`。已有 float/L2 DiskANN 索引时可以加 `--index-prefix /path/to/index/sift1m`，脚本会复用对应的 `_disk.index` 和两个 PQ 文件。首次运行加 `--load-bam`，脚本会确认仿真盘报告 512 B LBA，然后从 `/dev/libnvm0` 的 namespace 1、LBA 0 写入索引数据。后续使用同一份已装载索引时省略 `--load-bam`。`--bam-launcher ''` 可用于当前账户已有设备权限的环境。
+SIFT1M 目录放置 `sift_base.fvecs`、`sift_query.fvecs` 和 `sift_groundtruth.ivecs`。使用相同的 `--index-prefix` 可以在不同实验中复用 `_disk.index` 和两个 PQ 文件。先在 SwarmIO 创建匹配的实例，4 KiB 对应 `io_unit_shift=12`，512 B 对应 `io_unit_shift=9`。如果 `/proc/swarmio/io_unit_shift` 可读，脚本会在发起装载或搜索前核对该值。BaM 还会确认 namespace 报告 512 B LBA。
+
+新实例首次运行加 `--load-bam`，脚本以所选粒度从 `/dev/libnvm0` 的 namespace 1、LBA 0 写入索引数据。复用同一实例上的同一份索引时省略 `--load-bam`。`--bam-launcher ''` 可用于当前账户已有设备权限的环境。
 
 ```bash
+# After creating the 4 KiB SwarmIO instance
 python3 scripts/benchmark_sift1m.py \
   --sift-dir /data/sift1m --index-prefix /data/index/sift1m \
-  --out-dir results/sift1m-sim --load-bam
+  --out-dir results/sift1m-bam-4k --scenarios bam-4k --load-bam
+
+# After creating the 512 B SwarmIO instance
+python3 scripts/benchmark_sift1m.py \
+  --sift-dir /data/sift1m --index-prefix /data/index/sift1m \
+  --out-dir results/sift1m-bam-512 --scenarios bam-512 --load-bam
 ```
 
 每条记录是一批 10,000 条查询，Recall@10 使用同一份 ground truth。`measurements.jsonl` 保留原始批次，`sweep.json` 汇总每个 `L`，`recall_targets.json` 为每个目标选取达到该 Recall 的实测点中 QPS 最高的一条。`--trials` 可重复独立进程，吞吐使用批次时长中位数，达标按最低实测 Recall 判断。达不到的目标标为 `unreached`，可用 `--search-list` 扩大或加密扫描。延迟字段 `batch_latency_ms` 表示整批完成时间，DiskANN 另外保留工具输出的单查询平均和 P99.9 延迟。I/O 指标是搜索阶段应用发起的读命令和字节数。DiskANN 使用工具输出的 `Mean IOs` 估算，GustANN 直接计数。BaM 的总量包含补充读，报告同时给出主读和补充读。仿真器的设备侧数据可用命令 trace 另行核对。
 
 ### BaM 读取和装载
 
-`--bam-io-size 4096` 仍按 DiskANN 的 4 KiB 数据页访问。在仿真盘上，每次缓存缺失提交一条覆盖 8 个 LBA 的主读。`--bam-io-size 512` 将 BaM 缓存槽和主读改为单 LBA，GPU 根据节点的向量字节数和实际度数，只获取所需扇区，并在块内共享内存中拼接。脚本为仿真盘启用 `--bam-sim`，要求一块 512 B LBA 的控制器。两组的 BaM 补充 READ 都读取 1 个 LBA，用于协调完成顺序。4 KiB 组的设备 trace 因此也会出现 512 B 补充读。两种模式共用同一盘上字节布局。装载器跳过完整索引文件的第一个 4 KiB 元数据页，从目标 LBA 0 开始写节点数据。
+`--bam-io-size 4096` 仍按 DiskANN 的 4 KiB 数据页访问。在仿真盘上，每次缓存缺失提交一条覆盖 8 个 LBA 的主读。`--bam-io-size 512` 将 BaM 缓存槽和主读改为单 LBA，GPU 根据节点的向量字节数和实际度数，只获取所需扇区，并在块内共享内存中拼接。脚本为仿真盘启用 `--bam-sim`，要求一块 512 B LBA 的控制器。两组的 BaM 补充 READ 都读取 1 个 LBA，用于协调完成顺序。4 KiB 组的设备 trace 因此也会出现 512 B 补充读。两种实例使用相同的索引字节布局。装载器跳过完整索引文件的第一个 4 KiB 元数据页，从各自目标盘的 LBA 0 开始写节点数据。
 
 ### 真实物理盘补测
 
